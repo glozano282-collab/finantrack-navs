@@ -50,17 +50,69 @@ const ISINS = [
   'IE0002RUHW32'
 ];
 
-function fetchJson(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }, (res) => {
+function fetchText(url) {
+  return new Promise((resolve) => {
+    const options = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    };
+    https.get(url, options, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchText(res.headers.location).then(resolve);
+      }
       let data = '';
       res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } 
-        catch (e) { resolve(null); }
-      });
-    }).on('error', reject);
+      res.on('end', () => resolve(data));
+    }).on('error', () => resolve(''));
   });
+}
+
+// 1. Obtener precio oficial desde Financial Times
+async function getPriceFromFT(isin) {
+  try {
+    const url = `https://markets.ft.com/data/funds/tearsheet/summary?s=${isin}:EUR`;
+    const html = await fetchText(url);
+    if (!html) return null;
+
+    const match = html.match(/Price\s*\([A-Z]{3}\)[^<]*<span[^>]*class="mod-ui-data-list__value"[^>]*>([\d\.,]+)<\/span>/i)
+               || html.match(/class="mod-ui-data-list__value">([\d\.,]+)<\/span>/i)
+               || html.match(/data-val="([\d\.,]+)"/i);
+
+    if (match && match[1]) {
+      const cleanVal = match[1].replace(/,/g, '');
+      const num = parseFloat(cleanVal);
+      if (!isNaN(num) && num > 0) return num;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// 2. Respaldo desde Finect API / Web
+async function getPriceFromFinect(isin) {
+  try {
+    const apiUrl = `https://api.finect.com/v1/fund/${isin}`;
+    const rawJson = await fetchText(apiUrl);
+    if (rawJson) {
+      try {
+        const parsed = JSON.parse(rawJson);
+        if (parsed && parsed.price) return Number(parsed.price);
+      } catch (e) {}
+    }
+
+    const webUrl = `https://www.finect.com/fondos-inversion?query=${isin}`;
+    const html = await fetchText(webUrl);
+    if (html) {
+      const match = html.match(/([\d]+[,\.][\d]+)\s*€/);
+      if (match && match[1]) {
+        const cleanVal = match[1].replace(/\./g, '').replace(',', '.');
+        const num = parseFloat(cleanVal);
+        if (!isNaN(num) && num > 0) return num;
+      }
+    }
+  } catch (e) {}
+  return null;
 }
 
 async function run() {
@@ -69,29 +121,30 @@ async function run() {
     funds: {}
   };
 
+  console.log(`🔍 Consultando NAVs para ${ISINS.length} ISINs...`);
+
   for (const isin of ISINS) {
     const isinClean = isin.trim().toUpperCase();
-    try {
-      const url = `https://api.finect.com/v1/fund/${isinClean}`;
-      const data = await fetchJson(url);
+    let price = await getPriceFromFT(isinClean);
 
-      if (data && data.price) {
-        results.funds[isinClean] = {
-          nav: Number(data.price),
-          date: data.date || new Date().toISOString().slice(0, 10),
-          currency: data.currency || 'EUR'
-        };
-        console.log(`✅ [${isinClean}] NAV: ${data.price} EUR`);
-      } else {
-        console.log(`⚠️ [${isinClean}] No se obtuvo precio directo.`);
-      }
-    } catch (err) {
-      console.error(`❌ Error consultando ${isinClean}:`, err.message);
+    if (!price) {
+      price = await getPriceFromFinect(isinClean);
+    }
+
+    if (price && price > 0) {
+      results.funds[isinClean] = {
+        nav: price,
+        date: new Date().toISOString().slice(0, 10),
+        currency: 'EUR'
+      };
+      console.log(`✅ [${isinClean}] NAV: ${price} EUR`);
+    } else {
+      console.log(`⚠️ [${isinClean}] No se pudo obtener precio.`);
     }
   }
 
   fs.writeFileSync('navs.json', JSON.stringify(results, null, 2));
-  console.log('📁 Archivo navs.json generado e ISINs actualizados con éxito.');
+  console.log(`📁 Archivo navs.json actualizado correctamente con ${Object.keys(results.funds).length} fondos.`);
 }
 
 run();
